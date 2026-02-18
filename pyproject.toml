@@ -1,0 +1,15 @@
+[project]
+name = "nt13u_txm"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[tool.nt13u_txm.view]
+latest_json = "data/tmp/latest.json"
+poll_ms = 100
+width = 1600
+height = 1000
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+addopts = "-ra"
