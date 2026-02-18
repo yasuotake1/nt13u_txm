@@ -13,8 +13,7 @@ nt13u_txm/
 ├── data/
 │   └── tmp/
 │       ├── latest.json
-│       ├── NT13U_TXM_tmp_000.img
-│       └── NT13U_TXM_tmp_001.img
+│       └── ...
 ├── logs/
 │   └── remoteex.lock
 ├── scripts/
