@@ -1,0 +1,89 @@
+{
+  "date": "2026-02-19",
+  "repo_commit": "668282f5b0f1906a7599bba29d5a8889b1924657",
+  "principles_path": "docs/PRINCIPLES.md",
+  "results": [
+    {
+      "id": "I-LOCK-001",
+      "status": "FAIL",
+      "reason": "Some connect() paths catch exceptions without guaranteed disconnect(), which can leak lock/socket resources.",
+      "evidence": [
+        {"file": "src/nt13u_txm/meas/maincontrol.py", "start_line": 195, "end_line": 206},
+        {"file": "src/nt13u_txm/meas/maincontrol.py", "start_line": 291, "end_line": 297}
+      ],
+      "minimal_fix_strategy": "Wrap connect()+app_start/app_end sections in try/finally and always call disconnect() in finally when connection was established."
+    },
+    {
+      "id": "I-UI-001",
+      "status": "FAIL",
+      "reason": "UI-thread methods execute potentially long blocking device I/O (connect/app_start/app_end).",
+      "evidence": [
+        {"file": "src/nt13u_txm/meas/maincontrol.py", "start_line": 186, "end_line": 199},
+        {"file": "src/nt13u_txm/meas/maincontrol.py", "start_line": 289, "end_line": 294},
+        {"file": "src/nt13u_txm/meas/remoteexclient.py", "start_line": 195, "end_line": 209}
+      ],
+      "minimal_fix_strategy": "Move startup/shutdown device operations to a worker thread and signal completion back to UI."
+    },
+    {
+      "id": "I-STOP-001",
+      "status": "FAIL",
+      "reason": "STOP flag is checked only at loop boundary, so a stop request can race and still allow one new acquisition to start.",
+      "evidence": [
+        {"file": "src/nt13u_txm/meas/maincontrol.py", "start_line": 93, "end_line": 103},
+        {"file": "src/nt13u_txm/meas/maincontrol.py", "start_line": 124, "end_line": 125},
+        {"file": "src/nt13u_txm/meas/maincontrol.py", "start_line": 248, "end_line": 253}
+      ],
+      "minimal_fix_strategy": "Re-check stop immediately before acq_and_wait() (and after parameter updates) to prevent post-STOP starts."
+    },
+    {
+      "id": "I-LIFECYCLE-001",
+      "status": "FAIL",
+      "reason": "AcqStart is issued but no explicit AcqEnd is sent by the initiating component.",
+      "evidence": [
+        {"file": "src/nt13u_txm/meas/remoteexclient.py", "start_line": 341, "end_line": 365},
+        {"file": "src/nt13u_txm/meas/remoteexclient.py", "start_line": 375, "end_line": 383}
+      ],
+      "minimal_fix_strategy": "Add explicit AcqEnd API and invoke it in the same control path that performs AcqStart."
+    },
+    {
+      "id": "I-STATE-001",
+      "status": "PASS",
+      "reason": "Exclusive file lock is acquired for each active device connection, preventing concurrent LIVE/measurement control among lock-respecting clients.",
+      "evidence": [
+        {"file": "src/nt13u_txm/meas/remoteexclient.py", "start_line": 39, "end_line": 50},
+        {"file": "src/nt13u_txm/meas/remoteexclient.py", "start_line": 144, "end_line": 174},
+        {"file": "src/nt13u_txm/meas/maincontrol.py", "start_line": 82, "end_line": 85}
+      ],
+      "minimal_fix_strategy": null
+    },
+    {
+      "id": "I-DATA-001",
+      "status": "FAIL",
+      "reason": "latest.json is overwritten directly without atomic write, so interruption during write can leave unreadable JSON.",
+      "evidence": [
+        {"file": "src/nt13u_txm/meas/maincontrol.py", "start_line": 46, "end_line": 54},
+        {"file": "src/nt13u_txm/view/viewlatest.py", "start_line": 318, "end_line": 320},
+        {"file": "src/nt13u_txm/view/viewlatest.py", "start_line": 365, "end_line": 366}
+      ],
+      "minimal_fix_strategy": "Write to temporary file and atomically replace latest.json; optionally keep last-known-good fallback."
+    }
+  ],
+  "commands_used": [
+    "git rev-parse HEAD",
+    "git rev-parse --short HEAD",
+    "date +%F",
+    "date +%Y%m%d",
+    "sed -n '1,240p' docs/PRINCIPLES.md",
+    "rg --files",
+    "rg -n \"connect\\(|disconnect\\(|AcqStart|AcqEnd|stop\\(|STOP|latest.json|LIVE|measurement|acquisition|RemoteExClient|thread|QThread|tk|mainloop\" src tests README.md docs/ARCHITECTURE.md",
+    "nl -ba src/nt13u_txm/meas/maincontrol.py | sed -n '1,360p'",
+    "nl -ba src/nt13u_txm/meas/remoteexclient.py | sed -n '1,140p'",
+    "nl -ba src/nt13u_txm/meas/remoteexclient.py | sed -n '130,460p'",
+    "nl -ba src/nt13u_txm/view/viewlatest.py | sed -n '280,430p'",
+    "python -m compileall -q src"
+  ],
+  "sanity": {
+    "compileall_src": "PASS",
+    "notes": "python -m compileall -q src exited successfully."
+  }
+}
