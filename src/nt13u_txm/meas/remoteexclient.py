@@ -372,6 +372,12 @@ class RemoteExClient:
         else:
             self.send_and_wait(f"ImgSave(Current,Img,{path},1)")
 
+    def stop(self) -> None:
+        if self.mode == CameraMode.Sequence:
+            self.send_and_wait("SeqStop()")
+        else:
+            self.send_and_wait("AcqStop()")
+
     def delete(self) -> None:
         self.send_and_wait("SeqDelete()" if self.mode == CameraMode.Sequence else "ImgDelete(All)")
 
