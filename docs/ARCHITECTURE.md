@@ -1,161 +1,119 @@
-# nt13u_txm — Architecture Overview
-Last updated: 2026-02-18
+# ARCHITECTURE
+
+This document describes the structural design of `nt13u_txm`.
+
+It focuses on:
+- Module responsibilities
+- Runtime structure
+- Threading model
+- High-level data flow
+
+Project-wide constraints and invariants are defined in `PRINCIPLES.md`.
 
 ---
 
-## 1. Design Philosophy
+## 1. Overall Structure
 
-This project is a migration from a monolithic C# GUI-based measurement system to a modular Python-based measurement environment.
+The project is organized into logical layers:
 
-Key goals:
-- Separate **LIVE preview** from **measurement logic**
-- Allow flexible, **script-driven** measurement workflows
-- Keep camera control (RemoteEx) **reusable and isolated**
-- Avoid tight coupling between GUI and measurement sequences
-- Enable long-term evolution of measurement logic
+- `meas/`     : Measurement control and device communication
+- `view/`     : Data visualization and live monitoring
+- `common/`   : Shared utilities (paths, configuration, helpers)
+- `docs/`     : Design documentation
 
-Operational rule:
-- All measurements start by launching `maincontrol`. `maincontrol` is the always-on main application.
+This separation reflects functional responsibility, not physical isolation.
 
 ---
 
-## 2. High-Level Architecture
+## 2. Entry Point
 
-```
-maincontrol (GUI, owns camera session)
-├── LiveWorker (thread)
-│   └── RemoteExClient
-│       └── data/tmp + latest.json
-├── Measurement (script or GUI-launched routine)
-│   └── RemoteExClient
-└── viewlatest (separate process, visualization only)
-```
+All measurement workflows start from `maincontrol`.
+
+- The application is launched via `maincontrol.main()`.
+- Measurement operations are initiated only from this entry point.
+- No independent measurement process is assumed outside `maincontrol`.
 
 ---
 
-## 3. Module Responsibilities
+## 3. Runtime Model
 
-### remoteexclient
+### 3.1 UI Layer
 
-Responsible for:
-- TCP communication with HiPic RemoteEx
-- Camera acquisition control
-- `app_start()` / `app_end()`
-- Save/Delete image
-- Blocking acquisition (`acq_and_wait`)
+- Implemented using Qt.
+- Responsible for:
+  - User interaction
+  - Status display
+  - Starting/stopping LIVE
+- Must not perform long-running device I/O.
 
-Design rule:
-- `__init__` does **NOT** call `app_start()`
-- Camera connection is controlled explicitly via `app_start()`
+### 3.2 Worker Layer
 
-### maincontrol
+LIVE acquisition runs in a dedicated worker object.
 
-Purpose:
-- LIVE ON/OFF GUI
-- Exposure modification
-- Entry point for measurements
+Responsibilities:
+- Device interaction via `RemoteExClient`
+- Acquisition loop
+- Saving images
+- Updating `latest.json`
+- Emitting signals to UI
 
-Confirmed rules:
-- On startup, always call `app_start()`
-- LIVE runs in a worker thread
-- Cannot close while LIVE or measurement is active
-- On shutdown, call `app_end()`
-
-### viewlatest
-
-Purpose:
-- Poll `data/tmp/latest.json`
-- Display most recent image
-
-Must never:
-- Communicate with RemoteEx directly
-- Block measurement logic
+Worker lifecycle:
+- Created when LIVE starts
+- Terminates when LIVE stops
+- Always emits completion signals
 
 ---
 
-## 4. Device Locking Strategy
+## 4. Device Communication
 
-Lock file: `logs/remoteex.lock`
+`RemoteExClient` abstracts communication with the measurement device.
 
-Policy:
-- If lock exists → raise error (`DeviceBusyError`)
-- GUI or script handles the error and informs the user
+Responsibilities:
+- Connection management
+- Acquisition commands
+- Status polling
+- File save/delete commands
 
----
-
-## 5. LIVE vs Measurement
-
-LIVE:
-- Loop in worker thread
-- Apply exposure if changed
-- Acquire
-- Save rotating tmp file (mod 10)
-- Delete on device
-- Update `latest.json`
-
-Measurement:
-1. External script (CLI/Jupyter)
-2. Standard routine launched from `maincontrol` GUI
-
-No concurrent LIVE + measurement.
+Design intent:
+- Connection ownership is explicit.
+- The caller controls acquisition start and end.
+- `stop()` exists as a callable API but is not part of normal graceful stop flow.
 
 ---
 
-## 6. RemoteEx Lifecycle
+## 5. Data Flow (LIVE)
 
-Observed behavior:
-- `app_start()` connects to camera
-- Closing TCP does **NOT** disconnect camera
-- Reconnecting TCP works without re-calling `app_start()`
-- `app_end()` releases camera
-
-Design decision:
-- `maincontrol` calls `app_start()` on launch
-- `maincontrol` calls `app_end()` on exit
-
----
-
-## 7. Data Flow
-
-Temporary images:
-- `data/tmp/NT13U_TXM_tmp_000.img` … `_009.img` (rotating)
-
-Viewer trigger file:
-- `data/tmp/latest.json`
-
-JSON format:
-```json
-{ "path": "...", "idx": 0, "timestamp": "...", "mode": "SingleAcquisition" }
-```
+1. UI toggles LIVE
+2. Worker connects to device
+3. Acquisition loop:
+   - Acquire
+   - Save
+   - Delete
+   - Update `latest.json`
+4. UI reads `latest.json` (polling)
+5. On STOP:
+   - No new acquisition begins
+   - Current acquisition completes
+   - Worker disconnects
 
 ---
 
-## 8. External / Shared Code Policy (BL_Parameters, Package_libBL13U)
+## 6. Shutdown Sequence
 
-The following directories are treated as **externally-maintained shared code**:
+Application shutdown is controlled by `maincontrol`.
 
-- `src/nt13u_txm/BL_Parameters/`
-- `src/nt13u_txm/Package_libBL13U/`
-
-Current policy (single-maintainer, keep things stable):
-- **Do not modify these directories locally**, even if there are obvious refactors or fixes to make.
-- These directories may be updated externally in the future; local edits would create **merge/conflict risk** and make upstream updates painful.
-- Folder names, file sets, and internal structure may change over time. Therefore:
-  - Avoid writing new project code that depends on their internal layout beyond a small, well-defined surface.
-
-If future changes are unavoidable:
-- Prefer adding a thin **adapter/wrapper** layer in `nt13u_txm` (e.g., `nt13u_txm/adapters/`) rather than editing the shared code directly.
-- Keep the adapter API stable so upstream updates can be absorbed by changing only the adapter.
+- `AcqEnd()` is sent by the component that initiated acquisition.
+- Shutdown must leave the device in a clean state.
+- No forced acquisition cancellation is assumed in normal flow.
 
 ---
 
-## 9. Future Direction
+## 7. Design Philosophy
 
-Planned:
-- Rewrite DCM driver
-- Rewrite Stage driver
-- Rewrite Counter driver
-- Abstract device interfaces
+- Single authoritative entry point
+- Clear responsibility boundaries
+- Explicit device lifecycle management
+- Graceful stop preferred over forced interruption
+- Failures that cannot be recovered in software are handled operationally
 
-Long-term:
-- Measurement Script → Device Abstractions → Hardware Drivers
+See `PRINCIPLES.md` for formal assumptions and invariants.
