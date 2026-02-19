@@ -58,3 +58,4 @@ LIVE and measurement operations must not run concurrently.
 ---
 
 Any architectural change must be checked against these principles.
+Verification results against this document are logged in `codex_reports/`.
