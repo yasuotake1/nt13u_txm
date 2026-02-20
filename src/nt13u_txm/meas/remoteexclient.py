@@ -6,7 +6,9 @@ import socket
 import time
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import List, Optional
+from dataclasses import dataclass
+from datetime import datetime
 
 # Windows file locking
 import msvcrt
@@ -23,6 +25,13 @@ class CameraMode(Enum):
     AnalogIntegration = auto()
     Sequence = auto()
 
+@dataclass
+class LockStatus:
+    locked: bool = False
+    timestamp: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return self.locked
 
 class _FileLockWin:
     """
@@ -31,22 +40,32 @@ class _FileLockWin:
     - lock is released automatically when the file handle is closed
     - we lock 1 byte from current file position (seek to 0)
     """
+    _TS_FIELD_BYTES = 32
 
-    def __init__(self, path: Path) -> None:
-        self._path = path
+    def __init__(self) -> None:
+        self._path = paths.get_remoteex_lock_path()
         self._fh = None
 
     def acquire(self) -> None:
+        if self._fh is not None:
+            raise RuntimeError("Lock already acquired")
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        # "a+" keeps file if exists, creates if not
-        fh = self._path.open("a+")
+
+        fh = self._path.open("a+b")
         try:
             fh.seek(0)
-            # Lock 1 byte, non-blocking
-            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)  # lock first 1 byte
         except OSError as e:
             fh.close()
-            raise DeviceBusyError(f"RemoteEx is already in use (lock: {self._path}).") from e
+            raise DeviceBusyError(
+                f"RemoteEx is already in use (lock: {self._path})."
+            ) from e
+        try:
+            ts = datetime.now().astimezone().isoformat(timespec="seconds")
+            self._write_timestamp_locked(fh, ts)
+        except Exception:
+            pass
+
         self._fh = fh
 
     def release(self) -> None:
@@ -65,18 +84,51 @@ class _FileLockWin:
             finally:
                 self._fh = None
 
+    def _make_timestamp(self) -> str:
+        return datetime.now().astimezone().isoformat(timespec="seconds")
+
+    def _write_timestamp_locked(self, fh, ts: str) -> None:
+        """
+        Write ISO8601 timestamp (1 line) into the first fixed-width region
+        of the lock file. Must be called only after lock acquisition.
+
+        - Uses first 32 bytes as timestamp header region.
+        - Format: "2026-02-20T13:42:18+09:00\n"
+        - Remaining bytes are padded with spaces.
+        """
+        try:
+            line = (ts + "\n").encode("ascii", errors="ignore")
+            if len(line) > self._TS_FIELD_BYTES:
+                line = line[:self._TS_FIELD_BYTES]
+
+            padded = line.ljust(self._TS_FIELD_BYTES, b" ")
+
+            fh.seek(0)
+            fh.write(padded)
+            fh.flush()
+        except Exception:
+            # Timestamp write failure must not break lock semantics
+            pass
+
+    def _read_timestamp(self) -> Optional[str]:
+        try:
+            with open(self._path, "r", encoding="ascii", errors="ignore") as f:
+                return f.read(self._TS_FIELD_BYTES).strip() or None
+        except Exception:
+            return None
+
     @staticmethod
-    def probe_locked(path: Path) -> bool:
+    def probe_locked() -> LockStatus:
         """
         Best-effort check: try acquiring lock and release immediately.
         True if locked by someone else.
         """
-        lock = _FileLockWin(path)
+        lock = _FileLockWin()
         try:
             lock.acquire()
-            return False
+            return LockStatus(False, None)
         except DeviceBusyError:
-            return True
+            return LockStatus(True, lock._read_timestamp())
         finally:
             lock.release()
 
@@ -101,7 +153,6 @@ class RemoteExClient:
         port_data: int = 1002,
         connect_timeout: float = 5.0,
         encoding: Optional[str] = None,
-        lock_path: Optional[Path] = None,
     ) -> None:
         # store connection params only (no socket connect here)
         self._host_cmd = host_cmd
@@ -111,13 +162,7 @@ class RemoteExClient:
         self._connect_timeout = float(connect_timeout)
         self._encoding = encoding or (locale.getpreferredencoding(False) or "utf-8")
 
-        # lock file under logs/
-        if lock_path is None:
-            logs = paths.get_logs_dir()
-            logs.mkdir(parents=True, exist_ok=True)
-            lock_path = logs / "remoteex.lock"
-        self._lock_path = lock_path
-        self._lock = _FileLockWin(self._lock_path)
+        self._lock = _FileLockWin()
 
         # sockets are created in connect()
         self._sock_cmd: Optional[socket.socket] = None
@@ -133,9 +178,9 @@ class RemoteExClient:
     # Lock probe (for UI)
     # -------------------------
 
-    def is_locked(self) -> bool:
+    def get_lock_status(self) -> LockStatus:
         """Best-effort: True if another process holds RemoteEx lock."""
-        return _FileLockWin.probe_locked(self._lock_path)
+        return _FileLockWin.probe_locked()
 
     # -------------------------
     # Connection lifecycle

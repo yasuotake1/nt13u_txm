@@ -179,7 +179,6 @@ class ViewLatestWindow(QtWidgets.QMainWindow):
         vbox.addStretch(1)
 
         # ---- internal state ----
-        self._last_idx: Optional[int] = None
         self._last_path: Optional[str] = None
         self._ranged_once = False
         self._force_level_update = False
@@ -318,17 +317,16 @@ class ViewLatestWindow(QtWidgets.QMainWindow):
         try:
             info = json.loads(self.latest_json.read_text(encoding="utf-8"))
             path = str(info["path"])
-            idx = int(info.get("idx", -1))
             ts = str(info.get("timestamp", ""))
             mode = str(info.get("mode", ""))
 
             # 更新判定：新しいidx（またはpath）なら読み直す
-            needs_reload = (self._last_idx != idx) or (self._last_path != path)
+            needs_reload = self._last_path != path
             if not needs_reload and not self._force_level_update:
                 return
 
             img_path = Path(path)
-            self.lbl_info.setText(f"load idx={idx} mode={mode} timestamp={ts}")
+            self.lbl_info.setText(f"mode={mode} timestamp={ts}")
             self.lbl_file.setText(f"file: " + str(img_path).replace("\\", "\\" + "\u200b").replace("/", "/" + "\u200b"))
 
             arr_u = load_img_array(img_path)
@@ -359,7 +357,6 @@ class ViewLatestWindow(QtWidgets.QMainWindow):
                 self.lbl_max.setText(f"max: {vmax:.0f}")
                 self._safe_set_levels(vmin, vmax)
 
-            self._last_idx = idx
             self._last_path = path
 
         except Exception as e:

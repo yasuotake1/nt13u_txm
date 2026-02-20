@@ -2,15 +2,14 @@
 from __future__ import annotations
 
 import json
-import sys
-from dataclasses import dataclass
+import os, sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-import nt13u_txm._paths as p
+from nt13u_txm._paths import get_latest_json_path
 from nt13u_txm.meas.remoteexclient import CameraMode, DeviceBusyError, RemoteExClient
 
 
@@ -18,40 +17,39 @@ from nt13u_txm.meas.remoteexclient import CameraMode, DeviceBusyError, RemoteExC
 # Utilities
 # ---------------------------
 
-@dataclass
-class LiveConfig:
-    tmp_dir: Path
-    latest_json: Path
-    mode: CameraMode = CameraMode.SingleAcquisition
-    ring_size: int = 10  # 0..9
+# ---- LIVE configuration (single source of truth) ----
+LIVE_RING_SIZE = 10  # 0..9
+_live_tmp_idx = -1
+
+# These are set by MainControlWindow when LIVE starts.
+LIVE_MODE: CameraMode = CameraMode.SingleAcquisition  # keep CameraMode enum
+_latest_json = get_latest_json_path()
+_tmp_dir = _latest_json.parent
+_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+def next_tmp_path() -> Path:
+    global _live_tmp_idx
+    _live_tmp_idx = (_live_tmp_idx + 1) % LIVE_RING_SIZE
+    return _tmp_dir / f"ImagingXAFS_tmp_{_live_tmp_idx:03d}.img"
 
 
-class TempPathCycler:
-    """C# の idxTmp = idxTmp < 9 ? idxTmp + 1 : 0 を Python 化（リングバッファ）。"""
+def write_latest_json(img: Path) -> None:
+    global _latest_json
 
-    def __init__(self, tmp_dir: Path, ring_size: int = 10) -> None:
-        self._tmp_dir = tmp_dir
-        self._ring_size = ring_size
-        self._idx = 0
-
-    @property
-    def idx(self) -> int:
-        return self._idx
-
-    def next_path(self) -> Path:
-        self._idx = (self._idx + 1) % self._ring_size
-        return self._tmp_dir / f"ImagingXAFS_tmp_{self._idx:03d}.img"
-
-
-def write_latest_json(latest_json: Path, img: Path, idx: int, mode: CameraMode) -> None:
     latest = {
         "path": str(img),
-        "idx": int(idx),
         "timestamp": datetime.now().isoformat(timespec="milliseconds"),
-        "mode": mode.name,
+        "mode": LIVE_MODE.name,
     }
-    latest_json.parent.mkdir(parents=True, exist_ok=True)
-    latest_json.write_text(json.dumps(latest, ensure_ascii=False), encoding="utf-8")
+
+    tmp_path = _latest_json.with_suffix(_latest_json.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(latest, f, ensure_ascii=False)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(tmp_path, _latest_json)
 
 
 # ---------------------------
@@ -63,9 +61,8 @@ class LiveWorker(QtCore.QObject):
     sig_error = QtCore.Signal(str)
     sig_stopped = QtCore.Signal()
 
-    def __init__(self, cfg: LiveConfig, exposure_ms_getter) -> None:
+    def __init__(self, exposure_ms_getter) -> None:
         super().__init__()
-        self._cfg = cfg
         self._exposure_ms_getter = exposure_ms_getter  # callable returning int
         self._stop = False
 
@@ -73,11 +70,6 @@ class LiveWorker(QtCore.QObject):
     def run(self) -> None:
         """LIVE ループ本体：接続→(必要なら露光更新)→Acq→Save→Delete→latest.json→繰り返し。"""
         self._stop = False
-
-        # Ensure directories exist
-        self._cfg.tmp_dir.mkdir(parents=True, exist_ok=True)
-
-        cycler = TempPathCycler(self._cfg.tmp_dir, ring_size=self._cfg.ring_size)
 
         try:
             client = RemoteExClient()
@@ -87,7 +79,6 @@ class LiveWorker(QtCore.QObject):
             # 初期露光を反映
             exp_prev = int(self._exposure_ms_getter())
             client.set_single_acquisition(exp_prev)
-
             self.sig_status.emit(f"LIVE connected. exp={exp_prev} ms")
 
             while not self._stop:
@@ -101,10 +92,10 @@ class LiveWorker(QtCore.QObject):
                 client.acq_and_wait()
 
                 # Save/Delete/Show(=latest.json)
-                img_path = cycler.next_path()
+                img_path = next_tmp_path()
                 client.save(str(img_path))
                 client.delete()
-                write_latest_json(self._cfg.latest_json, img_path, cycler.idx, self._cfg.mode)
+                write_latest_json(img_path)
 
             self.sig_status.emit("LIVE stopping...")
 
@@ -121,6 +112,7 @@ class LiveWorker(QtCore.QObject):
                 pass
             self.sig_stopped.emit()
 
+    @QtCore.Slot()
     def request_stop(self) -> None:
         self._stop = True
 
@@ -136,10 +128,6 @@ class MainControlWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("MainControl (LIVE only)")
         self.resize(520, 220)
 
-        # Paths
-        self._tmp_dir = p.get_tmp_dir()
-        self._latest_json = self._tmp_dir / "latest.json"
-
         # --- UI ---
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -153,7 +141,7 @@ class MainControlWindow(QtWidgets.QMainWindow):
         self.spin_exp = QtWidgets.QSpinBox()
         self.spin_exp.setRange(1, 600_000)  # 1 ms .. 10 min
         self.spin_exp.setSingleStep(1)
-        self.spin_exp.setValue(100)
+        self.spin_exp.setValue(1000)
         self.spin_exp.setSuffix(" ms")
         form.addRow("Exposure", self.spin_exp)
 
@@ -214,42 +202,49 @@ class MainControlWindow(QtWidgets.QMainWindow):
             self._stop_live()
 
     def _start_live(self) -> None:
+        if self._thread is not None and self._thread.isRunning():
+            return
         if self._live_running:
             return
-
-        cfg = LiveConfig(
-            tmp_dir=self._tmp_dir,
-            latest_json=self._latest_json,
-            mode=CameraMode.SingleAcquisition,
-            ring_size=10,
-        )
-
-        self._thread = QtCore.QThread(self)
-        self._worker = LiveWorker(cfg, exposure_ms_getter=self._exposure_ms)
-        self._worker.moveToThread(self._thread)
+        
+        thread = QtCore.QThread(self)
+        worker = LiveWorker(exposure_ms_getter=self._exposure_ms)
+        worker.moveToThread(thread)
 
         # Wiring
-        self._thread.started.connect(self._worker.run)
-        self._worker.sig_status.connect(self.lbl_status.setText)
-        self._worker.sig_error.connect(self._on_live_error)
-        self._worker.sig_stopped.connect(self._on_live_stopped)
+        thread.started.connect(worker.run)
+        worker.sig_status.connect(self.lbl_status.setText)
+        worker.sig_error.connect(self._on_live_error)
+        worker.sig_stopped.connect(self._on_live_stopped)
+        worker.sig_stopped.connect(thread.quit)
+        worker.sig_stopped.connect(worker.deleteLater)
 
-        # Cleanup
-        self._worker.sig_stopped.connect(self._thread.quit)
-        self._thread.finished.connect(self._thread.deleteLater)
+        def _on_thread_finished() -> None:
+            self._live_running = False
+            self._worker = None
+            self._thread = None
+            if not self.btn_live.isChecked() and self.btn_live.isEnabled():
+                self.lbl_status.setText("Ready. (LIVE stopped)")
+
+        thread.finished.connect(_on_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+
+        self._thread = thread
+        self._worker = worker
 
         # UI state
         self._live_running = True
         self.btn_live.setEnabled(True)
         self.lbl_status.setText("LIVE starting...")
 
-        self._thread.start()
+        thread.start()
+
 
     def _stop_live(self) -> None:
         if not self._live_running:
             return
         if self._worker is not None:
-            self._worker.request_stop()
+            QtCore.QTimer.singleShot(0, self._worker.request_stop)
         self.lbl_status.setText("Stopping LIVE...")
 
         # NOTE: actual state reset happens in _on_live_stopped()
@@ -265,17 +260,15 @@ class MainControlWindow(QtWidgets.QMainWindow):
                 self.btn_live.blockSignals(False)
 
     def _on_live_stopped(self) -> None:
-        self._live_running = False
-
-        # worker/thread objects will be deleted via Qt parent or deleteLater
-        self._worker = None
-        self._thread = None
-
         if not self.btn_live.isChecked():
-            # if user turned it off normally
-            if not self.btn_live.isEnabled():
-                return
-            self.lbl_status.setText("Ready. (LIVE stopped)")
+            return
+
+        # ボタンがONのままstoppedが来るのは「例外停止」等なので、強制OFF
+        self.btn_live.blockSignals(True)
+        try:
+            self.btn_live.setChecked(False)
+        finally:
+            self.btn_live.blockSignals(False)
 
     # -------- window close --------
 
