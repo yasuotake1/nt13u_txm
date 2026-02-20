@@ -17,6 +17,9 @@ from nt13u_txm.meas.remoteexclient import CameraMode, DeviceBusyError, RemoteExC
 # Utilities
 # ---------------------------
 
+BUSY_STATE: int = 0
+MEAS_SELF: bool = False
+
 # ---- LIVE configuration (single source of truth) ----
 LIVE_RING_SIZE = 10  # 0..9
 _live_tmp_idx = -1
@@ -50,6 +53,27 @@ def write_latest_json(img: Path) -> None:
         os.fsync(f.fileno())
 
     os.replace(tmp_path, _latest_json)
+
+
+# ---------------------------
+# Startup worker (runs in QThread)
+# ---------------------------
+class StartupWorker(QtCore.QObject):
+    sig_ok = QtCore.Signal()
+    sig_error = QtCore.Signal(str)
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        try:
+            c = RemoteExClient()
+            c.connect()
+            c.app_start(timeout_ms=60_000)
+            c.disconnect()
+            self.sig_ok.emit()
+        except DeviceBusyError as e:
+            self.sig_error.emit(f"Device busy at startup: {e}")
+        except Exception as e:
+            self.sig_error.emit(f"{type(e).__name__}: {e}")
 
 
 # ---------------------------
@@ -123,6 +147,8 @@ class LiveWorker(QtCore.QObject):
 
 class MainControlWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
+        global BUSY_STATE, MEAS_SELF
+
         super().__init__()
 
         self.setWindowTitle("MainControl (LIVE only)")
@@ -165,33 +191,136 @@ class MainControlWindow(QtWidgets.QMainWindow):
         # Signals
         self.btn_live.toggled.connect(self._on_live_toggled)
 
-        # Startup: pre-warm camera by AppStart once, then disconnect
-        self._startup_camera()
+        # --- startup + polling state ---
+        # 0: free, 1: LIVE, 2: self measuring (reserved), 3: external measuring
+        BUSY_STATE = 0
+        MEAS_SELF = False  # 今は未使用（将来ルーチン測定で True にする）
+        self._probe_client = RemoteExClient()
+
+        # 500ms polling timer (startup完了後に開始)
+        self._poll_timer = QtCore.QTimer(self)
+        self._poll_timer.setInterval(500)
+        self._poll_timer.timeout.connect(self._poll_500ms)
+
+        # startup thread/worker/dialog
+        self._startup_thread: Optional[QtCore.QThread] = None
+        self._startup_worker: Optional[StartupWorker] = None
+        self._startup_dialog: Optional[QtWidgets.QProgressDialog] = None
+
+        # 起動中はウィンドウ全体を無効化（startup完了後に有効化）
+        self.setEnabled(False)
+        self._begin_startup()
 
     def _exposure_ms(self) -> int:
         return int(self.spin_exp.value())
 
-    def _startup_camera(self) -> None:
-        """
-        起動時に AppStart(0) だけ実行して切断（あなたの確認した挙動を利用）。
-        - ここで lock が取れない = 既に誰かが LIVE/測定中 → 起動失敗が妥当
-        """
-        self.lbl_status.setText("Connecting (AppStart)...")
-        QtWidgets.QApplication.processEvents()
+    def _begin_startup(self) -> None:
+        # splash的ProgressDialog（キャンセルなし・無限進捗）
+        dlg = QtWidgets.QProgressDialog("Starting camera (AppStart)...", "", 0, 0, self)
+        dlg.setWindowTitle("Starting")
+        dlg.setCancelButton(None)
+        dlg.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.show()
+        self._startup_dialog = dlg
 
-        try:
-            c = RemoteExClient()
-            c.connect()
-            c.app_start(timeout_ms=60_000)
-            c.disconnect()
-            self.lbl_status.setText("Ready. (camera initialized; sockets released)")
-        except DeviceBusyError as e:
-            self.lbl_status.setText(f"ERROR: Device busy at startup: {e}")
-            # 起動継続しても何もできないので、ボタンを無効化
+        # ワーカーをQThreadで実行
+        th = QtCore.QThread(self)
+        wk = StartupWorker()
+        wk.moveToThread(th)
+
+        th.started.connect(wk.run)
+        wk.sig_ok.connect(self._on_startup_ok)
+        wk.sig_error.connect(self._on_startup_error)
+
+        # 後始末
+        wk.sig_ok.connect(th.quit)
+        wk.sig_error.connect(th.quit)
+        th.finished.connect(th.deleteLater)
+        th.finished.connect(wk.deleteLater)
+
+        self._startup_thread = th
+        self._startup_worker = wk
+        th.start()
+
+
+    def _end_startup_dialog(self) -> None:
+        if self._startup_dialog is not None:
+            self._startup_dialog.hide()
+            self._startup_dialog.deleteLater()
+            self._startup_dialog = None
+        self._startup_thread = None
+        self._startup_worker = None
+
+
+    def _on_startup_ok(self) -> None:
+        self._end_startup_dialog()
+
+        # startup完了 → UIを有効化
+        self.setEnabled(True)
+        self.lbl_status.setText("Ready.\n(camera initialized; sockets released)")
+
+        # startup後のみポーリング開始
+        self._poll_timer.start()
+        self._poll_500ms()  # すぐ反映
+
+
+    def _on_startup_error(self, msg: str) -> None:
+        self._end_startup_dialog()
+
+        # 失敗時はkill前提：ウィンドウは無効のまま
+        self.lbl_status.setText(f"ERROR: {msg}")
+        self.setEnabled(False)
+
+    def _poll_500ms(self) -> None:
+        global BUSY_STATE
+        # 優先順位：LIVE > self measuring > external lock > free
+        if self._live_running:
+            new_state = 1
+        elif MEAS_SELF:
+            new_state = 2
+        else:
+            st = self._probe_client.get_lock_status()
+            new_state = 3 if st.locked else 0
+
+        if new_state != BUSY_STATE:
+            BUSY_STATE = new_state
+            self._apply_busy_state()
+
+        # 将来：ここにエネルギー/ステージ等のポーリングを追加していく
+
+
+    def _apply_busy_state(self) -> None:
+        s = int(BUSY_STATE)
+
+        if s == 0:
+            # free
+            self.spin_exp.setEnabled(True)
+            self.btn_live.setEnabled(True)
+            return
+
+        if s == 1:
+            # LIVE（停止できる必要があるのでボタンは有効）
+            self.spin_exp.setEnabled(True)
+            self.btn_live.setEnabled(True)
+            return
+
+        if s == 2:
+            # self measuring（将来用）
+            self.spin_exp.setEnabled(False)
             self.btn_live.setEnabled(False)
-        except Exception as e:
-            self.lbl_status.setText(f"ERROR: Startup failed: {type(e).__name__}: {e}")
-            self.btn_live.setEnabled(False)
+            return
+
+        if s == 3:
+            # external measuring：開始不可。もし万一ON中なら停止だけ許す。
+            self.spin_exp.setEnabled(False)
+            if self.btn_live.isChecked():
+                self.btn_live.setEnabled(True)
+            else:
+                self.btn_live.setEnabled(False)
+            return
 
     # -------- LIVE control --------
 
@@ -207,6 +336,17 @@ class MainControlWindow(QtWidgets.QMainWindow):
         if self._live_running:
             return
         
+        st = self._probe_client.get_lock_status()
+        if st.locked:
+            self.lbl_status.setText(f"ERROR: Device busy (locked at {st.timestamp or 'unknown'})")
+            if self.btn_live.isChecked():
+                self.btn_live.blockSignals(True)
+                try:
+                    self.btn_live.setChecked(False)
+                finally:
+                    self.btn_live.blockSignals(False)
+            return
+
         thread = QtCore.QThread(self)
         worker = LiveWorker(exposure_ms_getter=self._exposure_ms)
         worker.moveToThread(thread)
