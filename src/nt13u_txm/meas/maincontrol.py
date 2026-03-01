@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import json
-import os, sys
+import os
+import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, cast
 
-from pyqtgraph.Qt import QtCore, QtWidgets
+from PySide6 import QtCore, QtWidgets
+from PySide6.QtCore import QFile
+from PySide6.QtUiTools import QUiLoader
 
 from nt13u_txm._paths import get_latest_json_path
 from nt13u_txm.meas.remoteexclient import CameraMode, DeviceBusyError, RemoteExClient
@@ -29,6 +32,7 @@ LIVE_MODE: CameraMode = CameraMode.SingleAcquisition  # keep CameraMode enum
 _latest_json = get_latest_json_path()
 _tmp_dir = _latest_json.parent
 _tmp_dir.mkdir(parents=True, exist_ok=True)
+
 
 def next_tmp_path() -> Path:
     global _live_tmp_idx
@@ -56,8 +60,30 @@ def write_latest_json(img: Path) -> None:
 
 
 # ---------------------------
+# UI Loader
+# ---------------------------
+
+def load_ui(ui_path: Path, parent: Optional[QtWidgets.QWidget] = None) -> QtWidgets.QWidget:
+    """
+    Load a .ui file at runtime (no uic compile needed).
+    """
+    f = QFile(str(ui_path))
+    if not f.open(QFile.OpenModeFlag.ReadOnly):
+        raise FileNotFoundError(f"Failed to open .ui: {ui_path}")
+    try:
+        loader = QUiLoader()
+        w = loader.load(f, parent)
+        if w is None:
+            raise RuntimeError(f"QUiLoader failed to load UI: {ui_path}")
+        return w
+    finally:
+        f.close()
+
+
+# ---------------------------
 # Startup worker (runs in QThread)
 # ---------------------------
+
 class StartupWorker(QtCore.QObject):
     sig_ok = QtCore.Signal()
     sig_error = QtCore.Signal(str)
@@ -129,7 +155,6 @@ class LiveWorker(QtCore.QObject):
             self.sig_error.emit(f"{type(e).__name__}: {e}")
         finally:
             try:
-                # Disconnect releases lock
                 if "client" in locals():
                     client.disconnect()
             except Exception:
@@ -152,36 +177,27 @@ class MainControlWindow(QtWidgets.QMainWindow):
         super().__init__()
 
         self.setWindowTitle("MainControl (LIVE only)")
+        # ここも .ui 側に寄せたいなら削ってOK（ただしQMainWindowの初期サイズは結局ここで決まる）
         self.resize(520, 220)
 
-        # --- UI ---
-        central = QtWidgets.QWidget()
-        self.setCentralWidget(central)
-        layout = QtWidgets.QVBoxLayout(central)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        # --- UI: load .ui (top-level QWidget) and set as centralWidget ---
+        ui_path = Path(__file__).with_name("maincontrol.ui")
+        root = load_ui(ui_path, parent=self)
+        self.setCentralWidget(root)
+        self._ui_root = root  # centralWidget only disable/enable target
 
-        form = QtWidgets.QFormLayout()
-        layout.addLayout(form)
+        # ---- bind widgets by objectName ----
+        self.spin_exp = cast(QtWidgets.QSpinBox, root.findChild(QtWidgets.QSpinBox, "spin_exp"))
+        self.btn_live = cast(QtWidgets.QPushButton, root.findChild(QtWidgets.QPushButton, "btn_live"))
+        self.lbl_status = cast(QtWidgets.QLabel, root.findChild(QtWidgets.QLabel, "lbl_status"))
 
-        self.spin_exp = QtWidgets.QSpinBox()
-        self.spin_exp.setRange(1, 600_000)  # 1 ms .. 10 min
-        self.spin_exp.setSingleStep(1)
-        self.spin_exp.setValue(1000)
-        self.spin_exp.setSuffix(" ms")
-        form.addRow("Exposure", self.spin_exp)
-
-        self.btn_live = QtWidgets.QPushButton("LIVE")
-        self.btn_live.setCheckable(True)
-        self.btn_live.setChecked(False)
-        self.btn_live.setMinimumHeight(36)
-        layout.addWidget(self.btn_live)
-
-        self.lbl_status = QtWidgets.QLabel("startup...")
-        self.lbl_status.setWordWrap(True)
-        layout.addWidget(self.lbl_status)
-
-        layout.addStretch(1)
+        missing = [name for name, w in [
+            ("spin_exp", self.spin_exp),
+            ("btn_live", self.btn_live),
+            ("lbl_status", self.lbl_status),
+        ] if w is None]
+        if missing:
+            raise RuntimeError(f"Missing widget(s) in UI (objectName mismatch): {missing}")
 
         # --- worker/thread state ---
         self._thread: Optional[QtCore.QThread] = None
@@ -207,12 +223,22 @@ class MainControlWindow(QtWidgets.QMainWindow):
         self._startup_worker: Optional[StartupWorker] = None
         self._startup_dialog: Optional[QtWidgets.QProgressDialog] = None
 
-        # 起動中はウィンドウ全体を無効化（startup完了後に有効化）
-        self.setEnabled(False)
+        # 起動中は centralWidget のみ無効化（startup完了後に有効化）
+        self._ui_root.setEnabled(False)
+        self._set_status("startup...")
         self._begin_startup()
+
+    # ---------- status helper ----------
+
+    @QtCore.Slot(str)
+    def _set_status(self, text: str) -> None:
+        # ここに将来ログウィンドウ、statusBar 等を足せる
+        self.lbl_status.setText(text)
 
     def _exposure_ms(self) -> int:
         return int(self.spin_exp.value())
+
+    # ---------- startup ----------
 
     def _begin_startup(self) -> None:
         # splash的ProgressDialog（キャンセルなし・無限進捗）
@@ -245,7 +271,6 @@ class MainControlWindow(QtWidgets.QMainWindow):
         self._startup_worker = wk
         th.start()
 
-
     def _end_startup_dialog(self) -> None:
         if self._startup_dialog is not None:
             self._startup_dialog.hide()
@@ -254,28 +279,29 @@ class MainControlWindow(QtWidgets.QMainWindow):
         self._startup_thread = None
         self._startup_worker = None
 
-
     def _on_startup_ok(self) -> None:
         self._end_startup_dialog()
 
         # startup完了 → UIを有効化
-        self.setEnabled(True)
-        self.lbl_status.setText("Ready.\n(camera initialized; sockets released)")
+        self._ui_root.setEnabled(True)
+        self._set_status("Ready.\n(camera initialized; sockets released)")
 
         # startup後のみポーリング開始
         self._poll_timer.start()
         self._poll_500ms()  # すぐ反映
 
-
     def _on_startup_error(self, msg: str) -> None:
         self._end_startup_dialog()
 
-        # 失敗時はkill前提：ウィンドウは無効のまま
-        self.lbl_status.setText(f"ERROR: {msg}")
-        self.setEnabled(False)
+        # 失敗時はkill前提：UIは無効のまま
+        self._set_status(f"ERROR: {msg}")
+        self._ui_root.setEnabled(False)
+
+    # ---------- polling ----------
 
     def _poll_500ms(self) -> None:
         global BUSY_STATE
+
         # 優先順位：LIVE > self measuring > external lock > free
         if self._live_running:
             new_state = 1
@@ -290,7 +316,6 @@ class MainControlWindow(QtWidgets.QMainWindow):
             self._apply_busy_state()
 
         # 将来：ここにエネルギー/ステージ等のポーリングを追加していく
-
 
     def _apply_busy_state(self) -> None:
         s = int(BUSY_STATE)
@@ -335,10 +360,10 @@ class MainControlWindow(QtWidgets.QMainWindow):
             return
         if self._live_running:
             return
-        
+
         st = self._probe_client.get_lock_status()
         if st.locked:
-            self.lbl_status.setText(f"ERROR: Device busy (locked at {st.timestamp or 'unknown'})")
+            self._set_status(f"ERROR: Device busy (locked at {st.timestamp or 'unknown'})")
             if self.btn_live.isChecked():
                 self.btn_live.blockSignals(True)
                 try:
@@ -353,7 +378,7 @@ class MainControlWindow(QtWidgets.QMainWindow):
 
         # Wiring
         thread.started.connect(worker.run)
-        worker.sig_status.connect(self.lbl_status.setText)
+        worker.sig_status.connect(self._set_status)
         worker.sig_error.connect(self._on_live_error)
         worker.sig_stopped.connect(self._on_live_stopped)
         worker.sig_stopped.connect(thread.quit)
@@ -364,7 +389,7 @@ class MainControlWindow(QtWidgets.QMainWindow):
             self._worker = None
             self._thread = None
             if not self.btn_live.isChecked() and self.btn_live.isEnabled():
-                self.lbl_status.setText("Ready. (LIVE stopped)")
+                self._set_status("Ready. (LIVE stopped)")
 
         thread.finished.connect(_on_thread_finished)
         thread.finished.connect(thread.deleteLater)
@@ -375,23 +400,22 @@ class MainControlWindow(QtWidgets.QMainWindow):
         # UI state
         self._live_running = True
         self.btn_live.setEnabled(True)
-        self.lbl_status.setText("LIVE starting...")
+        self._set_status("LIVE starting...")
 
         thread.start()
-
 
     def _stop_live(self) -> None:
         if not self._live_running:
             return
         if self._worker is not None:
             QtCore.QTimer.singleShot(0, self._worker.request_stop)
-        self.lbl_status.setText("Stopping LIVE...")
+        self._set_status("Stopping LIVE...")
 
         # NOTE: actual state reset happens in _on_live_stopped()
 
     def _on_live_error(self, msg: str) -> None:
         # Live worker reported error -> force button OFF
-        self.lbl_status.setText(f"ERROR: {msg}")
+        self._set_status(f"ERROR: {msg}")
         if self.btn_live.isChecked():
             self.btn_live.blockSignals(True)
             try:
@@ -426,7 +450,6 @@ class MainControlWindow(QtWidgets.QMainWindow):
             c.app_end(timeout_ms=20_000)
             c.disconnect()
         except Exception:
-            # 終了動作なので握りつぶす（ログに出したければここで print）
             pass
 
         event.accept()

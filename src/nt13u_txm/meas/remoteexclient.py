@@ -60,12 +60,7 @@ class _FileLockWin:
             raise DeviceBusyError(
                 f"RemoteEx is already in use (lock: {self._path})."
             ) from e
-        try:
-            ts = datetime.now().astimezone().isoformat(timespec="seconds")
-            self._write_timestamp_locked(fh, ts)
-        except Exception:
-            pass
-
+        self._write_timestamp_locked(fh)
         self._fh = fh
 
     def release(self) -> None:
@@ -84,10 +79,7 @@ class _FileLockWin:
             finally:
                 self._fh = None
 
-    def _make_timestamp(self) -> str:
-        return datetime.now().astimezone().isoformat(timespec="seconds")
-
-    def _write_timestamp_locked(self, fh, ts: str) -> None:
+    def _write_timestamp_locked(self, fh) -> None:
         """
         Write ISO8601 timestamp (1 line) into the first fixed-width region
         of the lock file. Must be called only after lock acquisition.
@@ -97,6 +89,7 @@ class _FileLockWin:
         - Remaining bytes are padded with spaces.
         """
         try:
+            ts = datetime.now().astimezone().isoformat(timespec="seconds")
             line = (ts + "\n").encode("ascii", errors="ignore")
             if len(line) > self._TS_FIELD_BYTES:
                 line = line[:self._TS_FIELD_BYTES]
